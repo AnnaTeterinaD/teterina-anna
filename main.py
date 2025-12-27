@@ -1,510 +1,540 @@
 import pandas as pd
 import numpy as np
-import lightgbm as lgb
-import re
-import os
 import random
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-from sklearn.model_selection import GroupKFold
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import TruncatedSVD
+from catboost import CatBoostRegressor, Pool
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
-SEED = 993
+SEED = 322
 
-def set_all_seeds(seed=SEED):
-    """Установка сидов для воспроизводимости"""
-    random.seed(seed)
+def set_all_seeds(seed):
+    """Установка сидов для всех библиотек"""
     np.random.seed(seed)
+    random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['LIGHTGBM_SEED'] = str(seed)
+    print(f"Установлен глобальный seed: {seed}")
 
-def load_data():
+
+def load_data(train_path=r'data/train.csv',
+              test_path=r'data/test.csv'):
     """Загрузка данных"""
-    print("Загрузка данных...")
-    train_df = pd.read_csv('data/train.csv')
-    test_df = pd.read_csv('data/test.csv')
-    print(f"Train: {train_df.shape}, Test: {test_df.shape}")
-    return train_df, test_df
 
-def preprocess_data(train_df, test_df):
-    print("\nПредобработка данных...")
-    def fast_preprocess(text):
-        if pd.isna(text):
-            return ""
-        text = str(text).lower()
-        text = re.sub(r'[^\w\s]', ' ', text)
-        text = re.sub(r'\s+', ' ', text)
-        return text.strip()
-    for df in [train_df, test_df]:
-        df['query_clean'] = df['query'].apply(fast_preprocess)
-        df['title_clean'] = df['product_title'].apply(fast_preprocess)
-        df['desc_clean'] = df['product_description'].apply(fast_preprocess)
-        df['bullets_clean'] = df['product_bullet_point'].fillna('').apply(fast_preprocess)
-        df['product_text'] = df['title_clean'] + ' ' + df['desc_clean'] + ' ' + df['bullets_clean']
-    return train_df, test_df
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path)
 
-def create_features(df, train_df_ref=None, is_train=True):
-    features = pd.DataFrame(index=df.index)
-    features['query_len'] = df['query_clean'].str.len()
-    features['title_len'] = df['title_clean'].str.len()
-    features['desc_len'] = df['desc_clean'].str.len()
-    features['query_words'] = df['query_clean'].str.split().str.len()
-    features['title_words'] = df['title_clean'].str.split().str.len()
-    features['desc_words'] = df['desc_clean'].str.split().str.len()
+    if 'row_id' not in test.columns:
+        test['row_id'] = np.arange(len(test))
 
-    def enhanced_jaccard(row, n=10):
-        q_words = str(row['query_clean']).split()[:n]
-        t_words = str(row['title_clean']).split()[:n]
-
-        if not q_words or not t_words:
-            return 0
-        q_set = set(q_words)
-        t_set = set(t_words)
-        intersection = len(q_set & t_set)
-        union = len(q_set) + len(t_set) - intersection
-        return intersection / union if union > 0 else 0
-    features['jaccard_5'] = df.apply(lambda x: enhanced_jaccard(x, 5), axis=1)
-    features['jaccard_10'] = df.apply(lambda x: enhanced_jaccard(x, 10), axis=1)
-    features['jaccard_15'] = df.apply(lambda x: enhanced_jaccard(x, 15), axis=1)
-
-    def enhanced_coverage(row):
-        q_words = set(str(row['query_clean']).split())
-        t_words = set(str(row['title_clean']).split())
-
-        if not q_words:
-            return 0
-
-        intersection = len(q_words & t_words)
-        return intersection / len(q_words)
-    features['coverage'] = df.apply(enhanced_coverage, axis=1)
-
-    def reverse_coverage(row):
-        q_words = set(str(row['query_clean']).split())
-        t_words = set(str(row['title_clean']).split())
-
-        if not t_words:
-            return 0
-
-        intersection = len(q_words & t_words)
-        return intersection / len(t_words)
-
-    features['reverse_coverage'] = df.apply(reverse_coverage, axis=1)
-
-    def common_words_metrics(row):
-        q_words = set(str(row['query_clean']).split())
-        t_words = set(str(row['title_clean']).split())
-        intersection = len(q_words & t_words)
-        return pd.Series({
-            'common_words': intersection,
-            'common_ratio': intersection / (len(q_words) + 1e-10),
-            'dice_coeff': 2 * intersection / (len(q_words) + len(t_words) + 1e-10)
-        })
-    common_metrics = df.apply(common_words_metrics, axis=1)
-    features = pd.concat([features, common_metrics], axis=1)
+    return train, test
 
 
-    features['exact_match'] = df.apply(
-        lambda row: 1 if str(row['query_clean']).strip() in str(row['title_clean']) else 0, 
-        axis=1
-    )
+def prepare_features_improved(df, is_train=True, label_encoders=None, scalers=None):
+    """Улучшенная подготовка признаков"""
+    df = df.copy()
 
-    features['title_starts_with_query'] = df.apply(
-        lambda row: 1 if str(row['title_clean']).startswith(str(row['query_clean']).strip()) else 0,
-        axis=1
-    )
-    
+    if label_encoders is None:
+        label_encoders = {}
+    if scalers is None:
+        scalers = {}
 
-    ecommerce_keywords = ['new', 'best', '2024', '2023', 'sale', 'cheap', 'price',
-                         'professional', 'quality', 'original', 'free', 'shipping']
-    
-    for keyword in ecommerce_keywords[:10]:
-        features[f'query_{keyword}'] = df['query_clean'].str.contains(keyword, na=False).astype(int)
-        features[f'title_{keyword}'] = df['title_clean'].str.contains(keyword, na=False).astype(int)
+    if 'dt' in df.columns:
+        df['dt'] = pd.to_datetime(df['dt'])
+        df['year'] = df['dt'].dt.year
+        df['month'] = df['dt'].dt.month
+        df['dow'] = df['dt'].dt.dayofweek
+        df['day_of_month'] = df['dt'].dt.day
+        df['day_of_year'] = df['dt'].dt.dayofyear
+        df['week_of_year'] = df['dt'].dt.isocalendar().week.astype(int)
+        df['quarter'] = df['dt'].dt.quarter
 
-    features['len_ratio'] = features['query_len'] / (features['title_len'] + 1)
-    features['words_ratio'] = features['query_words'] / (features['title_words'] + 1)
-    features['len_diff'] = np.abs(features['query_len'] - features['title_len'])
-    features['words_diff'] = np.abs(features['query_words'] - features['title_words'])
+        df['is_weekend'] = (df['dow'] >= 5).astype(int)
+        df['is_month_end'] = df['dt'].dt.is_month_end.astype(int)
+        df['is_month_start'] = df['dt'].dt.is_month_start.astype(int)
 
-    features['query_has_digits'] = df['query_clean'].str.contains(r'\d', na=False).astype(int)
-    features['title_has_digits'] = df['title_clean'].str.contains(r'\d', na=False).astype(int)
+        df['season'] = df['month'] % 12 // 3 + 1
+        df['is_summer'] = ((df['month'] >= 6) & (df['month'] <= 8)).astype(int)
+        df['is_winter'] = ((df['month'] <= 2) | (df['month'] == 12)).astype(int)
 
-    if 'product_brand' in df.columns:
-        features['has_brand'] = df['product_brand'].notna().astype(int)
-        if is_train:
-            brand_counts = df['product_brand'].fillna('').value_counts()
-        else:
-            brand_counts = train_df_ref['product_brand'].fillna('').value_counts()
-        features['brand_freq'] = df['product_brand'].fillna('').map(brand_counts).fillna(1)
-    
-    if 'product_color' in df.columns:
-        features['has_color'] = df['product_color'].notna().astype(int)
-    
-    if 'product_locale' in df.columns:
-        features['locale_us'] = (df['product_locale'] == 'en_US').astype(int)
+        df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7)
+        df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7)
+        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
-    temp_df = df.copy()
-    temp_df['title_len_temp'] = features['title_len']
-    temp_df['title_words_temp'] = features['title_words']
-    
-    if 'query_id' in temp_df.columns:
-        features['query_group_size'] = temp_df.groupby('query_id')['query_id'].transform('count')
-        features['title_len_mean_in_group'] = temp_df.groupby('query_id')['title_len_temp'].transform('mean')
-        features['title_words_mean_in_group'] = temp_df.groupby('query_id')['title_words_temp'].transform('mean')
-        features['title_len_rank_pct'] = temp_df.groupby('query_id')['title_len_temp'].rank(pct=True)
+    if all(col in df.columns for col in ['avg_temperature', 'avg_humidity']):
+        df['temp_humidity'] = df['avg_temperature'] * df['avg_humidity']
+        df['feels_like'] = 0.5 * (df['avg_temperature'] + 61.0 + (df['avg_temperature'] - 68.0) * 1.2 + df['avg_humidity'] * 0.094)
 
-    features['jaccard_x_coverage'] = features['jaccard_10'] * features['coverage']
-    features['coverage_x_len'] = features['coverage'] * features['title_len']
+    if 'n_stores' in df.columns:
+        df['log_stores'] = np.log1p(df['n_stores'])
 
-    features = features.fillna(0)
-    features = features.replace([np.inf, -np.inf], 0)
-    
-    return features
+    if is_train and 'product_id' in df.columns and 'price_p05' in df.columns and 'price_p95' in df.columns:
+        product_stats = df.groupby('product_id').agg({
+            'price_p05': ['mean', 'median', 'std', 'min', 'max'],
+            'price_p95': ['mean', 'median', 'std', 'min', 'max'],
+        }).round(2)
 
-def create_tfidf_features(train_df, test_df):
+        new_columns = []
+        for col in product_stats.columns:
+            if col[0] == 'price_p05':
+                new_columns.append(f'product_p05_{col[1]}')
+            elif col[0] == 'price_p95':
+                new_columns.append(f'product_p95_{col[1]}')
 
+        product_stats.columns = new_columns
 
-
-    title_vec = TfidfVectorizer(
-        max_features=500,
-        ngram_range=(1, 2),
-        min_df=2,
-        max_df=0.95
-    )
-
-    all_titles = pd.concat([train_df['title_clean'], test_df['title_clean']])
-    title_vec.fit(all_titles)
-
-    train_title_vec = title_vec.transform(train_df['title_clean'])
-    test_title_vec = title_vec.transform(test_df['title_clean'])
-
-    svd = TruncatedSVD(n_components=80, random_state=SEED, n_iter=5)
-    train_title_svd = svd.fit_transform(train_title_vec)
-    test_title_svd = svd.transform(test_title_vec)
-
-    query_vec = CountVectorizer(
-        max_features=300,
-        ngram_range=(1, 3),
-        binary=True,
-        min_df=2
-    )
-    
-    all_queries = pd.concat([train_df['query_clean'], test_df['query_clean']])
-    query_vec.fit(all_queries)
-    
-    train_query_vec = query_vec.transform(train_df['query_clean'])
-    test_query_vec = query_vec.transform(test_df['query_clean'])
-    
-    svd_query = TruncatedSVD(n_components=50, random_state=SEED, n_iter=5)
-    train_query_svd = svd_query.fit_transform(train_query_vec)
-    test_query_svd = svd_query.transform(test_query_vec)
-
-    def safe_cosine_similarity(query_svd, title_svd):
-        n_samples = query_svd.shape[0]
-        similarities = np.zeros(n_samples)
+        product_stats['product_price_range'] = product_stats['product_p95_max'] - product_stats['product_p05_min']
+        product_stats['product_price_ratio'] = product_stats['product_p95_mean'] / (product_stats['product_p05_mean'] + 1e-8)
+        product_stats['product_price_cv'] = product_stats['product_p95_std'] / (product_stats['product_p95_mean'] + 1e-8)
         
-        for i in range(n_samples):
-            query_vec_i = query_svd[i]
-            title_vec_i = title_svd[i]
-            
-            query_norm = np.linalg.norm(query_vec_i)
-            title_norm = np.linalg.norm(title_vec_i)
-            
-            if query_norm > 0 and title_norm > 0:
-                similarities[i] = np.dot(query_vec_i, title_vec_i) / (query_norm * title_norm)
-            else:
-                similarities[i] = 0
-        
-        return similarities.reshape(-1, 1)
-    
-    print("Вычисление косинусного сходства...")
-    train_cosine = safe_cosine_similarity(train_query_svd, train_title_svd[:, :50])
-    test_cosine = safe_cosine_similarity(test_query_svd, test_title_svd[:, :50])
+        label_encoders['product_stats'] = product_stats
 
-    train_unique_words = (train_query_vec != 0).sum(axis=1).A.astype(np.float32)
-    test_unique_words = (test_query_vec != 0).sum(axis=1).A.astype(np.float32)
-    
-    return (train_query_svd, train_title_svd, train_cosine, train_unique_words,
-            test_query_svd, test_title_svd, test_cosine, test_unique_words)
+    if not is_train and 'product_stats' in label_encoders:
+        product_stats = label_encoders['product_stats']
+        for col in product_stats.columns:
+            df[f'{col}'] = df['product_id'].map(
+                product_stats[col].to_dict()
+            ).fillna(0)
 
-def combine_features(manual_features, query_svd, title_svd, cosine_sim, unique_words):
+    if is_train and 'price_p05' in df.columns and 'price_p95' in df.columns:
+        df = df.sort_values(['product_id', 'dt']).reset_index(drop=True)
 
-    features = np.hstack([
-        manual_features.values.astype(np.float32),
-        query_svd.astype(np.float32),
-        title_svd.astype(np.float32),
-        cosine_sim.astype(np.float32),
-        unique_words,
-        np.log1p(unique_words)
-    ])
-    return features
+        for lag in [1, 7, 14]:
+            df[f'price_p05_lag_{lag}'] = df.groupby('product_id')['price_p05'].shift(lag)
+            df[f'price_p95_lag_{lag}'] = df.groupby('product_id')['price_p95'].shift(lag)
 
-def train_model(X_train, y_train, groups, X_test):
+        for window in [7, 14]:
+            df[f'price_p05_roll_mean_{window}'] = df.groupby('product_id')['price_p05'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).mean()
+            )
+            df[f'price_p95_roll_mean_{window}'] = df.groupby('product_id')['price_p95'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).mean()
+            )
+
+    cat_cols = ['management_group_id', 'first_category_id', 
+                'second_category_id', 'third_category_id',
+                'season', 'quarter']
+
+    for col in cat_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+
+    return df, label_encoders, scalers
 
 
+def train_catboost_model(X_train, y_train, X_val, y_val, cat_indices, alpha, model_name, seed_offset=0):
+    """Обучает CatBoost модель"""
+    print(f"Training {model_name} with alpha={alpha}...")
     params = {
-        'objective': 'lambdarank',
-        'metric': 'ndcg',
-        'ndcg_eval_at': [10],
-        'boosting_type': 'gbdt',
-        'num_leaves': 511,
-        'max_depth': 9,
-        'learning_rate': 0.025,
-        'feature_fraction': 0.7,
-        'bagging_fraction': 0.85,
-        'bagging_freq': 5,
-        'min_child_samples': 20,
-        'min_child_weight': 0.001,
-        'reg_alpha': 0.01,
-        'reg_lambda': 0.01,
-        'max_bin': 511,
-        'verbosity': -1,
-        'num_threads': 8,
-        'seed': SEED,
-        'deterministic': True,
+        'iterations': 1500,
+        'learning_rate': 0.05,
+        'depth': 7,
+        'l2_leaf_reg': 3.0,
+        'border_count': 128,
+        'loss_function': f'Quantile:alpha={alpha}',
+        'eval_metric': f'Quantile:alpha={alpha}',
+        'random_seed': SEED + seed_offset,
+        'verbose': 100,
+        'early_stopping_rounds': 50,
+        'use_best_model': True,
+        'task_type': 'CPU',
+        'thread_count': -1,
+        'cat_features': cat_indices,
+        'bootstrap_type': 'Bernoulli',
+        'subsample': 0.8,
+        'random_strength': 1.0,
+        'leaf_estimation_method': 'Gradient',
     }
 
-    def calculate_ndcg(y_true, y_pred, query_ids, k=10):
+    model = CatBoostRegressor(**params)
 
-        df = pd.DataFrame({
-            'query_id': query_ids,
-            'true': y_true,
-            'pred': y_pred
-        })
-        
-        ndcg_sum = 0
-        query_count = 0
-        
-        for qid in df['query_id'].unique():
-            q_data = df[df['query_id'] == qid]
-            if len(q_data) < 2:
-                continue
-                
-            sorted_idx = np.argsort(-q_data['pred'].values)
-            sorted_true = q_data['true'].values[sorted_idx]
-            
-            ideal_idx = np.argsort(-q_data['true'].values)
-            ideal_true = q_data['true'].values[ideal_idx]
-            
-            dcg = 0
-            idcg = 0
-            for i in range(min(len(sorted_true), k)):
-                dcg += (2**sorted_true[i] - 1) / np.log2(i + 2)
-                idcg += (2**ideal_true[i] - 1) / np.log2(i + 2)
-            
-            if idcg > 0:
-                ndcg_sum += dcg / idcg
-                query_count += 1
-        
-        return ndcg_sum / query_count if query_count > 0 else 0
-    
+    train_pool = Pool(X_train, y_train, cat_features=cat_indices)
+    val_pool = Pool(X_val, y_val, cat_features=cat_indices)
 
-    gkf = GroupKFold(n_splits=5)
-    cv_scores = []
-    models = []
-    oof_predictions = np.zeros(len(X_train))
-    
-    for fold, (train_idx, val_idx) in enumerate(gkf.split(X_train, y_train, groups)):
-        print(f"\nFold {fold + 1}/5")
-        
-        X_tr = X_train[train_idx]
-        X_val = X_train[val_idx]
-        y_tr = y_train[train_idx]
-        y_val = y_train[val_idx]
-        groups_tr = groups[train_idx]
-        
-
-        unique_groups_tr = np.unique(groups_tr)
-        group_sizes_tr = np.array([np.sum(groups_tr == g) for g in unique_groups_tr])
-
-        train_data = lgb.Dataset(X_tr, label=y_tr, group=group_sizes_tr)
-        
-        model = lgb.train(
-            params,
-            train_data,
-            num_boost_round=1500,
-            valid_sets=[train_data],
-            valid_names=['train'],
-            callbacks=[
-                lgb.early_stopping(100, verbose=False),
-                lgb.log_evaluation(200)
-            ]
-        )
-
-        y_val_pred = model.predict(X_val)
-        oof_predictions[val_idx] = y_val_pred
-
-        ndcg_score = calculate_ndcg(y_val, y_val_pred, groups[val_idx], k=10)
-        cv_scores.append(ndcg_score)
-        models.append(model)
-        
-        print(f"Fold {fold + 1} - nDCG@10: {ndcg_score:.5f}")
-        print(f"Best iteration: {model.best_iteration}")
-
-    print(f"\n{'='*60}")
-    print("РЕЗУЛЬТАТЫ КРОСС-ВАЛИДАЦИИ")
-    print(f"{'='*60}")
-    
-    for i, score in enumerate(cv_scores):
-        print(f"Fold {i+1}: nDCG@10 = {score:.5f}")
-    
-    mean_cv = np.mean(cv_scores)
-    std_cv = np.std(cv_scores)
-    print(f"\nСредний nDCG@10: {mean_cv:.5f} (+/- {std_cv:.5f})")
-    
-    # OOF оценка
-    oof_ndcg = calculate_ndcg(y_train, oof_predictions, groups, k=10)
-    print(f"Out-of-Fold nDCG@10: {oof_ndcg:.5f}")
-
-
-    unique_groups_all = np.unique(groups)
-    group_sizes_all = np.array([np.sum(groups == g) for g in unique_groups_all])
-    
-    train_data_all = lgb.Dataset(X_train, label=y_train, group=group_sizes_all)
-    
-    best_iterations = [model.best_iteration for model in models]
-    median_iterations = int(np.median(best_iterations))
-    final_num_round = min(median_iterations + 100, 2000)
- 
-    
-    final_model = lgb.train(
-        params,
-        train_data_all,
-        num_boost_round=final_num_round,
-        callbacks=[lgb.log_evaluation(100)]
+    model.fit(
+        train_pool,
+        eval_set=val_pool,
+        plot=False
     )
 
+    return model
 
-    cv_weights = [score/sum(cv_scores) for score in cv_scores]
-    test_preds_ensemble = np.zeros(len(X_test))
 
-    for model, weight in zip(models, cv_weights):
-        test_preds_ensemble += model.predict(X_test) * weight
+def calculate_iou(true_p05, true_p95, pred_p05, pred_p95, epsilon=1e-8):
+    """Вычисление IoU"""
+    true_lower = true_p05 - epsilon
+    true_upper = true_p95 + epsilon
+    pred_lower = pred_p05 - epsilon
+    pred_upper = pred_p95 + epsilon
 
-    test_preds_final = final_model.predict(X_test)
+    intersection = np.maximum(
+        0,
+        np.minimum(true_upper, pred_upper) -
+        np.maximum(true_lower, pred_lower)
+    )
 
-    test_preds_combined = 0.7 * test_preds_ensemble + 0.3 * test_preds_final
+    union = (true_upper - true_lower) + (pred_upper - pred_lower) - intersection
+    union = np.maximum(union, epsilon)
+    
+    iou = intersection / union
+    return np.mean(iou)
 
-    return test_preds_combined, mean_cv, oof_ndcg
 
-def create_submission(predictions, test_df, submission_path='results/submission.csv'):
+def create_submission(pred_p05, pred_p95, test_df, submission_path='results/submission.csv'):
 
     import os
 
-    os.makedirs('results', exist_ok=True)
+    os.makedirs(os.path.dirname(submission_path) if os.path.dirname(submission_path) else '.', exist_ok=True)
 
-    test_temp = test_df.copy()
-    test_temp['prediction'] = predictions
+    if 'row_id' not in test_df.columns:
+        test_df['row_id'] = np.arange(len(test_df))
 
-    def extreme_normalization(group):
+    pred_p05 = np.maximum(pred_p05, 0.01)
+    pred_p95 = np.maximum(pred_p95, pred_p05 + 0.01)
 
-        values = group.values.copy()
-        n = len(values)
-
-        if n <= 1:
-            return values
-
-        min_val, max_val = values.min(), values.max()
-
-        if max_val - min_val > 1e-10:
-            normalized = (values - min_val) / (max_val - min_val)
-        else:
-            normalized = np.zeros_like(values)
-
-        sorted_indices = np.argsort(-normalized)
-        rank_bonus = np.linspace(0.05, 0, n)
-
-        for i, idx in enumerate(sorted_indices):
-            normalized[idx] += rank_bonus[i]
-
-        if normalized.std() < 0.02:
-            noise = np.linspace(0, 0.03, n)
-            np.random.seed(SEED)
-            noise = noise + np.random.randn(n) * 0.005
-            normalized = normalized + noise
-
-        exp_values = np.exp(normalized * 2)
-        normalized = exp_values / exp_values.sum()
-
-        return np.clip(normalized, 0, 1)
-
-    test_temp['prediction_norm'] = test_temp.groupby('query_id')['prediction'].transform(extreme_normalization)
-    final_predictions = test_temp['prediction_norm'].values
-
-    final_predictions = (final_predictions - final_predictions.min()) / \
-                        (final_predictions.max() - final_predictions.min() + 1e-10)
-
+    pred_p05 = np.round(pred_p05, 2)
+    pred_p95 = np.round(pred_p95, 2)
+    
+    # Создаем сабмишн
     submission_df = pd.DataFrame({
-        'id': test_df['id'].values,
-        'prediction': final_predictions
+        'row_id': test_df['row_id'].values,
+        'price_p05': pred_p05,
+        'price_p95': pred_p95
     })
 
-    submission_df = submission_df.sort_values('id')
+    submission_df = submission_df.sort_values('row_id')
     submission_df.to_csv(submission_path, index=False)
 
-    print(f"\n{'='*60}")
-    print(f"SUBMISSION СОХРАНЕН: {submission_path}")
-    print(f"{'='*60}")
 
+    width_stats = submission_df['price_p95'] - submission_df['price_p05']
+    print(f"Interval width - Min: {width_stats.min():.2f}, "
+          f"Mean: {width_stats.mean():.2f}, "
+          f"Max: {width_stats.max():.2f}")
 
     return submission_df, submission_path
 
-def main():
-    """
-    Главная функция программы
-    """
-    print("=" * 60)
-    print("Запуск решения соревнования по ранжированию")
-    print("=" * 60)
 
+def main():
+    """Главная функция программы"""
     try:
         set_all_seeds(SEED)
-        print(f"Установлен глобальный seed: {SEED}")
-
-        train_df, test_df = load_data()
-
-        train_df, test_df = preprocess_data(train_df, test_df)
+        train, test = load_data()
 
 
-        train_manual = create_features(train_df, train_df_ref=train_df, is_train=True)
-        test_manual = create_features(test_df, train_df_ref=train_df, is_train=False)
-        print(f"Создано {train_manual.shape[1]} супер-признаков")
+        train_features, label_encoders, scalers = prepare_features_improved(train, is_train=True)
+        test_features, _, _ = prepare_features_improved(test, is_train=False, label_encoders=label_encoders)
 
-        (train_query_svd, train_title_svd, train_cosine, train_unique_words,
-         test_query_svd, test_title_svd, test_cosine, test_unique_words) = create_tfidf_features(train_df, test_df)
 
-        print("\nКомбинирование всех признаков...")
-        X_train = combine_features(train_manual, train_query_svd, train_title_svd,
-                                 train_cosine, train_unique_words)
-        X_test = combine_features(test_manual, test_query_svd, test_title_svd,
-                                test_cosine, test_unique_words)
+        feature_cols = [
 
-        print(f"Общая размерность: X_train {X_train.shape}, X_test {X_test.shape}")
+            'management_group_id', 'first_category_id', 'second_category_id', 'third_category_id',
+            'season', 'quarter',
 
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
+            'month', 'dow', 'day_of_month', 'week_of_year',
+            'is_weekend', 'is_month_end', 'is_month_start',
+            'dow_sin', 'dow_cos', 'month_sin', 'month_cos',
 
-        y_train = train_df['relevance'].values
-        groups = train_df['query_id'].values
-        test_ids = test_df['id'].values
+            'avg_temperature', 'avg_humidity', 'avg_wind_level', 'precpt',
+            'temp_humidity', 'feels_like',
 
-        predictions, mean_cv, oof_ndcg = train_model(X_train_scaled, y_train, groups, X_test_scaled)
+            'n_stores', 'log_stores',
 
-        submission_df, submission_path = create_submission(predictions, test_df)
+            'holiday_flag', 'activity_flag',
+        ]
 
+        product_stat_cols = [col for col in train_features.columns if col.startswith('product_')]
+        feature_cols.extend(product_stat_cols)
+
+        for col in train_features.columns:
+            if any(x in col for x in ['lag_', 'roll_']) and col not in feature_cols:
+                feature_cols.append(col)
+
+        feature_cols = [f for f in feature_cols
+                       if f in train_features.columns and f in test_features.columns]
+        
+        print(f"Всего признаков: {len(feature_cols)}")
+
+
+        train_features = train_features.sort_values(['product_id', 'dt']).reset_index(drop=True)
+        val_size = int(len(train_features) * 0.2)
+        train_data = train_features.iloc[:-val_size]
+        val_data = train_features.iloc[-val_size:]
+
+        X_train_raw = train_data[feature_cols].copy()
+        X_val_raw = val_data[feature_cols].copy()
+        X_test_raw = test_features[feature_cols].copy()
+        
+        y_train_p05 = train_data['price_p05'].values
+        y_train_p95 = train_data['price_p95'].values
+        y_val_p05 = val_data['price_p05'].values
+        y_val_p95 = val_data['price_p95'].values
+
+        cat_cols_for_cb = ['management_group_id', 'first_category_id', 
+                          'second_category_id', 'third_category_id',
+                          'season', 'quarter']
+        cat_cols_for_cb = [col for col in cat_cols_for_cb if col in feature_cols]
+        
+        num_cols = [col for col in feature_cols if col not in cat_cols_for_cb]
+        
+        print(f"Категориальные признаки: {len(cat_cols_for_cb)}")
+        print(f"Числовые признаки: {len(num_cols)}")
+
+        imputer = SimpleImputer(strategy='median')
+
+        if num_cols:
+            X_train_num = pd.DataFrame(
+                imputer.fit_transform(X_train_raw[num_cols]),
+                columns=num_cols,
+                index=X_train_raw.index
+            )
+            X_val_num = pd.DataFrame(
+                imputer.transform(X_val_raw[num_cols]),
+                columns=num_cols,
+                index=X_val_raw.index
+            )
+            X_test_num = pd.DataFrame(
+                imputer.transform(X_test_raw[num_cols]),
+                columns=num_cols,
+                index=X_test_raw.index
+            )
+
+            X_train_cat = X_train_raw[cat_cols_for_cb].copy()
+            X_val_cat = X_val_raw[cat_cols_for_cb].copy()
+            X_test_cat = X_test_raw[cat_cols_for_cb].copy()
+
+            X_train = pd.concat([X_train_num, X_train_cat], axis=1)[feature_cols]
+            X_val = pd.concat([X_val_num, X_val_cat], axis=1)[feature_cols]
+            X_test = pd.concat([X_test_num, X_test_cat], axis=1)[feature_cols]
+        else:
+            X_train = X_train_raw.copy()
+            X_val = X_val_raw.copy()
+            X_test = X_test_raw.copy()
+
+        for col in cat_cols_for_cb:
+            X_train[col] = X_train[col].astype(str)
+            X_val[col] = X_val[col].astype(str)
+            X_test[col] = X_test[col].astype(str)
+
+            X_train[col] = X_train[col].replace('nan', 'missing').replace('None', 'missing')
+            X_val[col] = X_val[col].replace('nan', 'missing').replace('None', 'missing')
+            X_test[col] = X_test[col].replace('nan', 'missing').replace('None', 'missing')
+
+        cat_indices = [i for i, col in enumerate(feature_cols) if col in cat_cols_for_cb]
+
+        print(f"Train shape: {X_train.shape}")
+        print(f"Validation shape: {X_val.shape}")
+        print(f"Test shape: {X_test.shape}")
+
+
+        models_p05 = []
+        for i in range(2):
+            model = train_catboost_model(X_train, y_train_p05, X_val, y_val_p05, cat_indices, 0.05,
+                                        f"p05 модель {i+1}", seed_offset=i*10)
+            models_p05.append(model)
+
+        models_p95 = []
+        for i in range(2):
+            model = train_catboost_model(X_train, y_train_p95, X_val, y_val_p95, cat_indices, 0.95,
+                                        f"p95 модель {i+1}", seed_offset=i*10 + 5)
+            models_p95.append(model)
+
+
+
+
+        val_preds_p05 = [model.predict(X_val) for model in models_p05]
+        val_preds_p95 = [model.predict(X_val) for model in models_p95]
+
+        val_weights_p05 = [1.0, 0.8]
+        val_weights_p95 = [1.0, 0.8]
+        
+        val_pred_p05_weighted = np.average(val_preds_p05, axis=0, weights=val_weights_p05)
+        val_pred_p95_weighted = np.average(val_preds_p95, axis=0, weights=val_weights_p95)
+
+        val_pred_p05 = np.maximum(val_pred_p05_weighted, 0.01)
+        val_pred_p95 = np.maximum(val_pred_p95_weighted, val_pred_p05 + 0.01)
+        
+        initial_iou = calculate_iou(y_val_p05, y_val_p95, val_pred_p05, val_pred_p95)
+        print(f"Начальное IoU ансамбля: {initial_iou:.6f}")
+
+        print("\nВыполнение оптимизации...")
+        
+        best_iou = initial_iou
+        best_params = {
+            'width_factor': 1.0,
+            'shift_factor': 0.0,
+            'asymmetry': 0.0,
+            'method': 'midpoint'
+        }
+        best_pred_p05 = val_pred_p05.copy()
+        best_pred_p95 = val_pred_p95.copy()
+
+        methods = ['midpoint', 'lower', 'upper', 'both']
+        
+        np.random.seed(SEED)
+        for method in methods:
+            for width_factor in np.linspace(0.7, 1.5, 9):
+                for shift_factor in np.linspace(-0.1, 0.1, 5):
+                    for asymmetry in np.linspace(-0.1, 0.1, 5):
+                        
+                        if method == 'midpoint':
+
+                            val_mid = (val_pred_p05 + val_pred_p95) / 2
+                            val_width = val_pred_p95 - val_pred_p05
+                            
+                            adjusted_width = val_width * width_factor
+                            adjusted_mid = val_mid * (1 + shift_factor)
+                            
+                            adjusted_p05 = adjusted_mid - adjusted_width / 2
+                            adjusted_p95 = adjusted_mid + adjusted_width / 2
+                        
+                        elif method == 'lower':
+
+                            val_mid = (val_pred_p05 + val_pred_p95) / 2
+                            val_width = val_pred_p95 - val_pred_p05
+                            
+                            adjusted_width = val_width * width_factor
+                            adjusted_p05 = val_pred_p05 * (1 + shift_factor - asymmetry)
+                            adjusted_p95 = adjusted_p05 + adjusted_width
+                        
+                        elif method == 'upper':
+
+                            val_mid = (val_pred_p05 + val_pred_p95) / 2
+                            val_width = val_pred_p95 - val_pred_p05
+
+                            adjusted_width = val_width * width_factor
+                            adjusted_p95 = val_pred_p95 * (1 + shift_factor + asymmetry)
+                            adjusted_p05 = adjusted_p95 - adjusted_width
+
+                        else:
+                            adjusted_p05 = val_pred_p05 * (1 + shift_factor - asymmetry)
+                            adjusted_p95 = val_pred_p95 * (1 + shift_factor + asymmetry)
+                            adjusted_width = adjusted_p95 - adjusted_p05
+
+                            if width_factor != 1.0:
+                                adjusted_mid = (adjusted_p05 + adjusted_p95) / 2
+                                adjusted_p05 = adjusted_mid - (adjusted_width * width_factor) / 2
+                                adjusted_p95 = adjusted_mid + (adjusted_width * width_factor) / 2
+
+                        adjusted_p05 = np.maximum(adjusted_p05, 0.01)
+                        adjusted_p95 = np.maximum(adjusted_p95, adjusted_p05 + 0.01)
+
+                        iou = calculate_iou(y_val_p05, y_val_p95, adjusted_p05, adjusted_p95)
+
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_params = {
+                                'width_factor': width_factor,
+                                'shift_factor': shift_factor,
+                                'asymmetry': asymmetry,
+                                'method': method
+                            }
+                            best_pred_p05 = adjusted_p05.copy()
+                            best_pred_p95 = adjusted_p95.copy()
+
+        print(f"Лучший метод: {best_params['method']}")
+        print(f"Лучшие параметры: width={best_params['width_factor']:.3f}, "
+              f"shift={best_params['shift_factor']:.3f}, asym={best_params['asymmetry']:.3f}")
+        print(f"Лучшее IoU: {best_iou:.6f}")
+        print(f"Улучшение IoU: {best_iou - initial_iou:.6f}")
+
+        test_preds_p05 = [model.predict(X_test) for model in models_p05]
+        test_preds_p95 = [model.predict(X_test) for model in models_p95]
+
+        test_pred_p05 = np.average(test_preds_p05, axis=0, weights=val_weights_p05)
+        test_pred_p95 = np.average(test_preds_p95, axis=0, weights=val_weights_p95)
+
+        print(f"Применение лучшего метода калибровки: {best_params['method']}")
+
+        if best_params['method'] == 'midpoint':
+            test_mid = (test_pred_p05 + test_pred_p95) / 2
+            test_width = test_pred_p95 - test_pred_p05
+
+            adjusted_width = test_width * best_params['width_factor']
+            adjusted_mid = test_mid * (1 + best_params['shift_factor'])
+
+            test_pred_p05 = adjusted_mid - adjusted_width / 2
+            test_pred_p95 = adjusted_mid + adjusted_width / 2
+
+        elif best_params['method'] == 'lower':
+            test_mid = (test_pred_p05 + test_pred_p95) / 2
+            test_width = test_pred_p95 - test_pred_p05
+
+            adjusted_width = test_width * best_params['width_factor']
+            test_pred_p05 = test_pred_p05 * (1 + best_params['shift_factor'] - best_params['asymmetry'])
+            test_pred_p95 = test_pred_p05 + adjusted_width
+
+        elif best_params['method'] == 'upper':
+            test_mid = (test_pred_p05 + test_pred_p95) / 2
+            test_width = test_pred_p95 - test_pred_p05
+
+            adjusted_width = test_width * best_params['width_factor']
+            test_pred_p95 = test_pred_p95 * (1 + best_params['shift_factor'] + best_params['asymmetry'])
+            test_pred_p05 = test_pred_p95 - adjusted_width
+
+        else:
+            test_pred_p05 = test_pred_p05 * (1 + best_params['shift_factor'] - best_params['asymmetry'])
+            test_pred_p95 = test_pred_p95 * (1 + best_params['shift_factor'] + best_params['asymmetry'])
+
+            test_width = test_pred_p95 - test_pred_p05
+            if best_params['width_factor'] != 1.0:
+                test_mid = (test_pred_p05 + test_pred_p95) / 2
+                test_pred_p05 = test_mid - (test_width * best_params['width_factor']) / 2
+                test_pred_p95 = test_mid + (test_width * best_params['width_factor']) / 2
+
+        print("Применение интеллектуальной постобработки...")
+
+        train_p05_mean = train['price_p05'].mean()
+        train_p95_mean = train['price_p95'].mean()
+        train_width_mean = (train['price_p95'] - train['price_p05']).mean()
+
+        test_p05_mean = test_pred_p05.mean()
+        test_p95_mean = test_pred_p95.mean()
+
+        test_pred_p05 = test_pred_p05 * (train_p05_mean / test_p05_mean) * 0.3 + test_pred_p05 * 0.7
+        test_pred_p95 = test_pred_p95 * (train_p95_mean / test_p95_mean) * 0.3 + test_pred_p95 * 0.7
+
+        train_widths = train['price_p95'] - train['price_p05']
+        min_width = np.percentile(train_widths, 10)
+        max_width = np.percentile(train_widths, 90)
+
+        test_widths = test_pred_p95 - test_pred_p05
+
+        width_mask_small = test_widths < min_width
+        if width_mask_small.any():
+            mid = (test_pred_p05[width_mask_small] + test_pred_p95[width_mask_small]) / 2
+            test_pred_p05[width_mask_small] = mid - min_width / 2
+            test_pred_p95[width_mask_small] = mid + min_width / 2
+
+        width_mask_large = test_widths > max_width
+        if width_mask_large.any():
+            mid = (test_pred_p05[width_mask_large] + test_pred_p95[width_mask_large]) / 2
+            test_pred_p05[width_mask_large] = mid - max_width / 2
+            test_pred_p95[width_mask_large] = mid + max_width / 2
+
+        def winsorize(values, lower=0.01, upper=0.99):
+            lower_bound = np.percentile(values, lower * 100)
+            upper_bound = np.percentile(values, upper * 100)
+            return np.clip(values, lower_bound, upper_bound)
+
+        test_pred_p05 = winsorize(test_pred_p05, 0.01, 0.99)
+        test_pred_p95 = winsorize(test_pred_p95, 0.01, 0.99)
+        submission_df, submission_path = create_submission(
+            pred_p05=test_pred_p05,
+            pred_p95=test_pred_p95,
+            test_df=test,
+            submission_path='results/submission.csv'
+        )
 
     except Exception as e:
         print(f"Ошибка в выполнении: {e}")
+        import traceback
+        traceback.print_exc()
         raise
-
-    print("=" * 60)
-    print("Выполнение завершено успешно!")
-    print("=" * 60)
 
     return submission_df
 
+
 if __name__ == "__main__":
-    main()
+    submission = main()
